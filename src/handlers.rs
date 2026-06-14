@@ -1,48 +1,101 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use teloxide::prelude::*;
-use teloxide::types::Message;
-use teloxide::utils::command::BotCommands;
+use teloxide::types::{
+    InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message, InputFile,
+};
+use serde::{Serialize, Deserialize};
 
 use crate::db::Database;
 use crate::utils;
 
-#[derive(BotCommands, Clone)]
-#[command(
-    rename_rule = "lowercase",
-    description = "Бот для личных заметок. Используйте команды:"
-)]
-pub enum Command {
-    #[command(description = "Начать работу с ботом")]
-    Start,
-    #[command(description = "Добавить заметку: /add <название> | <текст>")]
-    Add(String),
-    #[command(description = "Посмотреть все заметки")]
-    List,
-    #[command(description = "Посмотреть заметку: /view <id>")]
-    View(String),
-    #[command(description = "Удалить заметку: /delete <id>")]
-    Delete(String),
-    #[command(description = "Поиск заметок: /search <запрос>")]
-    Search(String),
-    #[command(description = "Добавить тег: /tag <id> <тег>")]
-    Tag(String),
-    #[command(description = "Заметки по тегу: /bytag <тег>")]
-    ByTag(String),
-    #[command(description = "Напоминание: /remind <id> <дата>")]
-    Remind(String),
-    #[command(description = "Экспорт всех заметок")]
+const MAX_NOTE_TITLE: usize = 200;
+const MAX_NOTE_CONTENT: usize = 4000;
+const MAX_MESSAGE_LEN: usize = 4000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CallbackAction {
+    MainMenu,
+    AddNote,
+    ListNotes(u32),
+    ViewNote(i64),
+    DeleteNote(i64),
+    ConfirmDelete(i64),
+    Search,
+    TagNote(i64),
+    RemindNote(i64),
     Export,
-    #[command(description = "Помощь")]
-    Help,
+    Settings,
+}
+
+#[derive(Debug, Clone)]
+pub enum DialogueState {
+    Idle,
+    WaitingTitle,
+    WaitingContent,
+    WaitingSearch,
+    WaitingTag(i64),
+    WaitingRemindDate(i64),
 }
 
 #[derive(Clone)]
 pub struct Handlers {
     db: Database,
+    states: Arc<Mutex<HashMap<i64, DialogueState>>>,
+    creating_notes: Arc<Mutex<HashMap<i64, (String, String)>>>,
 }
 
 impl Handlers {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            states: Arc::new(Mutex::new(HashMap::new())),
+            creating_notes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn cb(action: &CallbackAction) -> String {
+        serde_json::to_string(action).expect("serialization should not fail")
+    }
+
+    pub fn main_menu() -> InlineKeyboardMarkup {
+        InlineKeyboardMarkup::new(vec![
+            vec![
+                InlineKeyboardButton::callback("📝 Добавить", Self::cb(&CallbackAction::AddNote)),
+                InlineKeyboardButton::callback("📋 Мои заметки", Self::cb(&CallbackAction::ListNotes(1))),
+            ],
+            vec![
+                InlineKeyboardButton::callback("🔍 Поиск", Self::cb(&CallbackAction::Search)),
+                InlineKeyboardButton::callback("⚙️ Настройки", Self::cb(&CallbackAction::Settings)),
+            ],
+        ])
+    }
+
+    pub fn back_menu() -> InlineKeyboardMarkup {
+        InlineKeyboardMarkup::new(vec![
+            vec![InlineKeyboardButton::callback("◀ Меню", Self::cb(&CallbackAction::MainMenu))],
+        ])
+    }
+
+    pub fn note_actions(note_id: i64) -> InlineKeyboardMarkup {
+        InlineKeyboardMarkup::new(vec![
+            vec![
+                InlineKeyboardButton::callback("✅ Удалить", Self::cb(&CallbackAction::DeleteNote(note_id))),
+                InlineKeyboardButton::callback("🏷 Тег", Self::cb(&CallbackAction::TagNote(note_id))),
+            ],
+            vec![
+                InlineKeyboardButton::callback("⏰ Напоминание", Self::cb(&CallbackAction::RemindNote(note_id))),
+                InlineKeyboardButton::callback("◀ Назад", Self::cb(&CallbackAction::ListNotes(1))),
+            ],
+        ])
+    }
+
+    pub fn settings_menu() -> InlineKeyboardMarkup {
+        InlineKeyboardMarkup::new(vec![
+            vec![InlineKeyboardButton::callback("📥 Экспорт .md", Self::cb(&CallbackAction::Export))],
+            vec![InlineKeyboardButton::callback("◀ Меню", Self::cb(&CallbackAction::MainMenu))],
+        ])
     }
 
     pub async fn handle_message(
@@ -50,200 +103,344 @@ impl Handlers {
         bot: Bot,
         msg: Message,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let user_id = msg.from.as_ref().unwrap().id.0 as i64;
+        let user_id = match msg.from.as_ref() {
+            Some(u) => u.id.0 as i64,
+            None => return Ok(()),
+        };
+        let chat_id = msg.chat.id;
+        let text = msg.text().unwrap_or("");
 
-        if let Some(text) = msg.text() {
-            if text.starts_with('/') {
-                return Ok(());
+        let (state, creating_title) = {
+            let states = self.states.lock().await;
+            let creating = self.creating_notes.lock().await;
+            (
+                states.get(&user_id).cloned().unwrap_or(DialogueState::Idle),
+                creating.get(&user_id).map(|(t, _)| t.clone()),
+            )
+        };
+
+        match state {
+            DialogueState::WaitingTitle => {
+                let title = text.trim().to_string();
+                if title.is_empty() {
+                    bot.send_message(chat_id, "❌ Название не может быть пустым. Попробуйте ещё раз:")
+                        .await?;
+                    return Ok(());
+                }
+                if title.len() > MAX_NOTE_TITLE {
+                    bot.send_message(chat_id, format!("❌ Слишком длинное название (макс. {} символов)", MAX_NOTE_TITLE))
+                        .await?;
+                    return Ok(());
+                }
+                {
+                    let mut creating = self.creating_notes.lock().await;
+                    creating.insert(user_id, (title, String::new()));
+                }
+                {
+                    let mut states = self.states.lock().await;
+                    states.insert(user_id, DialogueState::WaitingContent);
+                }
+                bot.send_message(chat_id, "✏️ Теперь введите текст заметки:").await?;
             }
+            DialogueState::WaitingContent => {
+                let content = text.trim().to_string();
+                if content.is_empty() {
+                    bot.send_message(chat_id, "❌ Текст не может быть пустым. Попробуйте ещё раз:")
+                        .await?;
+                    return Ok(());
+                }
+                if content.len() > MAX_NOTE_CONTENT {
+                    bot.send_message(chat_id, format!("❌ Слишком длинный текст (макс. {} символов)", MAX_NOTE_CONTENT))
+                        .await?;
+                    return Ok(());
+                }
+                let title = match creating_title {
+                    Some(t) => t,
+                    None => {
+                        bot.send_message(chat_id, "❌ Ошибка: название утеряно. Начните заново.")
+                            .reply_markup(Self::main_menu())
+                            .await?;
+                        {
+                            let mut states = self.states.lock().await;
+                            states.insert(user_id, DialogueState::Idle);
+                        }
+                        return Ok(());
+                    }
+                };
+                self.db.create_note(user_id, &title, &content).await?;
+                {
+                    let mut creating = self.creating_notes.lock().await;
+                    creating.remove(&user_id);
+                }
+                {
+                    let mut states = self.states.lock().await;
+                    states.insert(user_id, DialogueState::Idle);
+                }
+                bot.send_message(chat_id, "✅ Заметка сохранена!")
+                    .reply_markup(Self::back_menu())
+                    .await?;
+            }
+            DialogueState::WaitingSearch => {
+                {
+                    let mut states = self.states.lock().await;
+                    states.insert(user_id, DialogueState::Idle);
+                }
+                let notes = self.db.search_notes(user_id, text).await?;
+                if notes.is_empty() {
+                    bot.send_message(chat_id, "🔍 Ничего не найдено.")
+                        .reply_markup(Self::back_menu())
+                        .await?;
+                } else {
+                    let mut response = "🔍 Результаты поиска:\n\n".to_string();
+                    let mut buttons = Vec::new();
+                    for note in &notes {
+                        let title = utils::escape_html(&note.title);
+                        response.push_str(&format!("• {} (ID: {})\n", title, note.id));
+                        buttons.push(vec![
+                            InlineKeyboardButton::callback(
+                                format!("👁 #{}", note.id),
+                                Self::cb(&CallbackAction::ViewNote(note.id)),
+                            ),
+                        ]);
+                    }
+                    if response.len() > MAX_MESSAGE_LEN {
+                        response.truncate(MAX_MESSAGE_LEN);
+                        response.push_str("\n\n...(обрезано)");
+                    }
+                    buttons.push(vec![
+                        InlineKeyboardButton::callback("◀ Меню", Self::cb(&CallbackAction::MainMenu)),
+                    ]);
+                    bot.send_message(chat_id, response)
+                        .reply_markup(InlineKeyboardMarkup::new(buttons))
+                        .await?;
+                }
+            }
+            DialogueState::WaitingTag(note_id) => {
+                {
+                    let mut states = self.states.lock().await;
+                    states.insert(user_id, DialogueState::Idle);
+                }
+                let tag = text.trim().to_string();
+                if tag.is_empty() {
+                    bot.send_message(chat_id, "❌ Тег не может быть пустым.")
+                        .reply_markup(Self::note_actions(note_id))
+                        .await?;
+                    return Ok(());
+                }
+                self.db.add_tag(note_id, user_id, &tag).await?;
+                bot.send_message(chat_id, format!("✅ Тег '{}' добавлен к заметке #{}", utils::escape_html(&tag), note_id))
+                    .reply_markup(Self::note_actions(note_id))
+                    .await?;
+            }
+            DialogueState::WaitingRemindDate(note_id) => {
+                {
+                    let mut states = self.states.lock().await;
+                    states.insert(user_id, DialogueState::Idle);
+                }
+                match utils::parse_datetime(text) {
+                    Ok(remind_at) => {
+                        self.db.set_reminder(note_id, user_id, remind_at).await?;
+                        bot.send_message(
+                            chat_id,
+                            format!("⏰ Напоминание на {}", remind_at.format("%d.%m.%Y %H:%M")),
+                        )
+                        .reply_markup(Self::note_actions(note_id))
+                        .await?;
+                    }
+                    Err(e) => {
+                        bot.send_message(chat_id, format!("❌ {}", e))
+                            .reply_markup(Self::note_actions(note_id))
+                            .await?;
+                    }
+                }
+            }
+            DialogueState::Idle => {
+                bot.send_message(chat_id, "👋 Привет! Я бот для заметок.")
+                    .reply_markup(Self::main_menu())
+                    .await?;
+            }
+        }
 
-            let title = text.lines().next().unwrap_or("Без названия").to_string();
-            let content = text.to_string();
+        Ok(())
+    }
 
-            self.db.create_note(user_id, &title, &content).await?;
-            bot.send_message(msg.chat.id, "✅ Заметка сохранена!")
+    async fn edit_or_send(
+        bot: &Bot,
+        msg: &Option<teloxide::types::MaybeInaccessibleMessage>,
+        text: String,
+        markup: InlineKeyboardMarkup,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(msg)) = msg {
+            let _ = bot.edit_message_text(msg.chat.id, msg.id, text)
+                .reply_markup(markup)
+                .await;
+        } else {
+            bot.send_message(ChatId(0), text)
+                .reply_markup(markup)
                 .await?;
         }
         Ok(())
     }
 
-    pub async fn handle_command(
+    pub async fn handle_callback_query(
         &self,
         bot: Bot,
-        msg: Message,
-        cmd: Command,
+        q: CallbackQuery,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let user_id = msg.from.as_ref().unwrap().id.0 as i64;
+        let user_id = q.from.id.0 as i64;
+        let chat_id = q.message.as_ref().map(|m| m.chat().id).unwrap_or(ChatId(user_id));
+        let data = q.data.clone();
+        let data = data.as_deref().unwrap_or("");
+        let msg = q.message.clone();
 
-        match cmd {
-            Command::Start => {
-                bot.send_message(
-                    msg.chat.id,
-                    "👋 Привет! Я бот для личных заметок.\n\n\
-                     Просто отправьте текст — и он сохранится как заметка.\n\
-                     Или используйте команды из /help.",
-                )
-                .await?;
+        bot.answer_callback_query(q.id).await?;
+
+        let action: CallbackAction = match serde_json::from_str(data) {
+            Ok(a) => a,
+            Err(_) => return Ok(()),
+        };
+
+        match action {
+            CallbackAction::MainMenu => {
+                {
+                    let mut states = self.states.lock().await;
+                    states.insert(user_id, DialogueState::Idle);
+                }
+                Self::edit_or_send(&bot, &msg, "👋 Главное меню:".into(), Self::main_menu()).await?;
             }
-            Command::Help => {
-                bot.send_message(msg.chat.id, Command::descriptions().to_string())
-                    .await?;
+            CallbackAction::AddNote => {
+                {
+                    let mut states = self.states.lock().await;
+                    states.insert(user_id, DialogueState::WaitingTitle);
+                }
+                bot.send_message(chat_id, "✏️ Введите название заметки:").await?;
             }
-            Command::Add(args) => {
-                let parts: Vec<&str> = args.splitn(2, '|').collect();
-                let (title, content) = if parts.len() == 2 {
-                    (parts[0].trim().to_string(), parts[1].trim().to_string())
+            CallbackAction::ListNotes(page) => {
+                let notes = self.db.get_notes(user_id, page, 5).await?;
+                if notes.is_empty() {
+                    Self::edit_or_send(&bot, &msg, "📭 У вас пока нет заметок.".into(), Self::main_menu()).await?;
                 } else {
-                    (args.trim().lines().next().unwrap_or("Без названия").to_string(), args.trim().to_string())
-                };
-
-                self.db.create_note(user_id, &title, &content).await?;
-                bot.send_message(msg.chat.id, "✅ Заметка сохранена!")
-                    .await?;
-            }
-            Command::List => {
-                let notes = self.db.get_notes(user_id, 1, 10).await?;
-                let text = utils::format_note_list(&notes, 1);
-                bot.send_message(msg.chat.id, text)
-                    .parse_mode(teloxide::types::ParseMode::Html)
-                    .await?;
-            }
-            Command::View(id_str) => {
-                let id: i64 = match id_str.trim().parse() {
-                    Ok(id) => id,
-                    Err(_) => {
-                        bot.send_message(msg.chat.id, "❌ Неверный ID. Используйте /view <число>")
-                            .await?;
-                        return Ok(());
+                    let mut response = format!("📋 Заметки (стр. {}):\n\n", page);
+                    let mut buttons = Vec::new();
+                    for note in &notes {
+                        let title = utils::escape_html(&note.title);
+                        response.push_str(&format!("• {} (ID: {})\n", title, note.id));
+                        buttons.push(vec![
+                            InlineKeyboardButton::callback(
+                                format!("👁 #{}", note.id),
+                                Self::cb(&CallbackAction::ViewNote(note.id)),
+                            ),
+                        ]);
                     }
-                };
-                match self.db.get_note(id).await? {
+                    let mut nav = Vec::new();
+                    if page > 1 {
+                        nav.push(InlineKeyboardButton::callback(
+                            "◀",
+                            Self::cb(&CallbackAction::ListNotes(page - 1)),
+                        ));
+                    }
+                    nav.push(InlineKeyboardButton::callback(
+                        "◀ Меню",
+                        Self::cb(&CallbackAction::MainMenu),
+                    ));
+                    if notes.len() == 5 {
+                        nav.push(InlineKeyboardButton::callback(
+                            "▶",
+                            Self::cb(&CallbackAction::ListNotes(page + 1)),
+                        ));
+                    }
+                    buttons.push(nav);
+                    Self::edit_or_send(&bot, &msg, response, InlineKeyboardMarkup::new(buttons)).await?;
+                }
+            }
+            CallbackAction::ViewNote(id) => {
+                match self.db.get_note(id, user_id).await? {
                     Some(note) => {
-                        bot.send_message(msg.chat.id, utils::format_note(&note))
+                        let text = utils::format_note(&note);
+                        bot.send_message(chat_id, text)
                             .parse_mode(teloxide::types::ParseMode::Html)
+                            .reply_markup(Self::note_actions(id))
                             .await?;
                     }
                     None => {
-                        bot.send_message(msg.chat.id, "❌ Заметка не найдена.")
+                        bot.send_message(chat_id, "❌ Заметка не найдена.")
+                            .reply_markup(Self::main_menu())
                             .await?;
                     }
                 }
             }
-            Command::Delete(id_str) => {
-                let id: i64 = match id_str.trim().parse() {
-                    Ok(id) => id,
-                    Err(_) => {
-                        bot.send_message(msg.chat.id, "❌ Неверный ID.")
-                            .await?;
-                        return Ok(());
-                    }
-                };
-                match self.db.get_note(id).await? {
-                    Some(_) => {
-                        self.db.delete_note(id).await?;
-                        bot.send_message(msg.chat.id, "✅ Заметка удалена.")
-                            .await?;
-                    }
-                    None => {
-                        bot.send_message(msg.chat.id, "❌ Заметка не найдена.")
-                            .await?;
-                    }
-                }
-            }
-            Command::Search(query) => {
-                let notes = self.db.search_notes(user_id, query.trim()).await?;
-                let text = utils::format_note_list(&notes, 1);
-                bot.send_message(msg.chat.id, text)
-                    .parse_mode(teloxide::types::ParseMode::Html)
-                    .await?;
-            }
-            Command::Tag(args) => {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if parts.len() < 2 {
-                    bot.send_message(msg.chat.id, "❌ Формат: /tag <id> <тег>")
+            CallbackAction::DeleteNote(id) => {
+                if self.db.get_note(id, user_id).await?.is_none() {
+                    bot.send_message(chat_id, "❌ Заметка не найдена.")
+                        .reply_markup(Self::main_menu())
                         .await?;
                     return Ok(());
                 }
-                let note_id: i64 = match parts[0].trim().parse() {
-                    Ok(id) => id,
-                    Err(_) => {
-                        bot.send_message(msg.chat.id, "❌ Неверный ID.")
-                            .await?;
-                        return Ok(());
-                    }
-                };
-                let tag_name = parts[1].trim();
-                match self.db.get_note(note_id).await? {
-                    Some(_) => {
-                        self.db.add_tag(note_id, tag_name).await?;
-                        bot.send_message(
-                            msg.chat.id,
-                            format!("✅ Тег '{}' добавлен к заметке #{}", tag_name, note_id),
-                        )
-                        .await?;
-                    }
-                    None => {
-                        bot.send_message(msg.chat.id, "❌ Заметка не найдена.")
-                            .await?;
-                    }
+                let buttons = InlineKeyboardMarkup::new(vec![
+                    vec![
+                        InlineKeyboardButton::callback("✅ Да, удалить", Self::cb(&CallbackAction::ConfirmDelete(id))),
+                        InlineKeyboardButton::callback("❌ Нет", Self::cb(&CallbackAction::ViewNote(id))),
+                    ],
+                ]);
+                bot.send_message(chat_id, format!("⚠️ Удалить заметку #{}?", id))
+                    .reply_markup(buttons)
+                    .await?;
+            }
+            CallbackAction::ConfirmDelete(id) => {
+                self.db.delete_note(id, user_id).await?;
+                bot.send_message(chat_id, "✅ Заметка удалена.")
+                    .reply_markup(Self::main_menu())
+                    .await?;
+            }
+            CallbackAction::Search => {
+                {
+                    let mut states = self.states.lock().await;
+                    states.insert(user_id, DialogueState::WaitingSearch);
                 }
+                bot.send_message(chat_id, "🔍 Введите поисковый запрос:").await?;
             }
-            Command::ByTag(tag) => {
-                let notes = self.db.get_notes_by_tag(user_id, tag.trim()).await?;
-                let text = utils::format_note_list(&notes, 1);
-                bot.send_message(msg.chat.id, text)
-                    .parse_mode(teloxide::types::ParseMode::Html)
-                    .await?;
-            }
-            Command::Remind(args) => {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if parts.len() < 2 {
-                    bot.send_message(
-                        msg.chat.id,
-                        "❌ Формат: /remind <id> <дата>\nПример: /remind 1 2025-12-31 18:00",
-                    )
-                    .await?;
+            CallbackAction::TagNote(id) => {
+                if self.db.get_note(id, user_id).await?.is_none() {
+                    bot.send_message(chat_id, "❌ Заметка не найдена.")
+                        .reply_markup(Self::main_menu())
+                        .await?;
                     return Ok(());
                 }
-                let note_id: i64 = match parts[0].trim().parse() {
-                    Ok(id) => id,
-                    Err(_) => {
-                        bot.send_message(msg.chat.id, "❌ Неверный ID.")
-                            .await?;
-                        return Ok(());
-                    }
-                };
-                let date_str = parts[1].trim();
-                match utils::parse_datetime(date_str) {
-                    Ok(remind_at) => {
-                        match self.db.get_note(note_id).await? {
-                            Some(_) => {
-                                self.db.set_reminder(note_id, remind_at).await?;
-                                bot.send_message(
-                                    msg.chat.id,
-                                    format!(
-                                        "⏰ Напоминание на {}",
-                                        remind_at.format("%d.%m.%Y %H:%M")
-                                    ),
-                                )
-                                .await?;
-                            }
-                            None => {
-                                bot.send_message(msg.chat.id, "❌ Заметка не найдена.")
-                                    .await?;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        bot.send_message(msg.chat.id, format!("❌ {}", e))
-                            .await?;
-                    }
+                {
+                    let mut states = self.states.lock().await;
+                    states.insert(user_id, DialogueState::WaitingTag(id));
                 }
+                bot.send_message(chat_id, "🏷 Введите название тега:").await?;
             }
-            Command::Export => {
+            CallbackAction::RemindNote(id) => {
+                if self.db.get_note(id, user_id).await?.is_none() {
+                    bot.send_message(chat_id, "❌ Заметка не найдена.")
+                        .reply_markup(Self::main_menu())
+                        .await?;
+                    return Ok(());
+                }
+                {
+                    let mut states = self.states.lock().await;
+                    states.insert(user_id, DialogueState::WaitingRemindDate(id));
+                }
+                bot.send_message(chat_id, "⏰ Введите дату напоминания\n(формат: ГГГГ-ММ-ДД ЧЧ:ММ:СС или ДД.ММ.ГГГГ ЧЧ:ММ):").await?;
+            }
+            CallbackAction::Settings => {
+                Self::edit_or_send(&bot, &msg, "⚙️ Настройки:".into(), Self::settings_menu()).await?;
+            }
+            CallbackAction::Export => {
                 let notes = self.db.get_notes(user_id, 1, 1000).await?;
-                let text = utils::export_notes_to_text(&notes);
-                bot.send_message(msg.chat.id, text).await?;
+                if notes.is_empty() {
+                    bot.send_message(chat_id, "📭 Нечего экспортировать.")
+                        .reply_markup(Self::main_menu())
+                        .await?;
+                } else {
+                    let md_content = utils::export_notes_to_markdown(&notes);
+                    let file_name = format!("notes_export_{}.md", chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+                    bot.send_document(chat_id, InputFile::memory(md_content).file_name(file_name))
+                        .reply_markup(Self::main_menu())
+                        .await?;
+                }
             }
         }
 

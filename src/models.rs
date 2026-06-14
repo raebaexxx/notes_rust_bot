@@ -1,8 +1,6 @@
 use chrono::NaiveDateTime;
-use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Note {
     pub id: i64,
     pub user_id: i64,
@@ -12,8 +10,8 @@ pub struct Note {
     pub updated_at: NaiveDateTime,
 }
 
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Reminder {
     pub id: i64,
     pub note_id: i64,

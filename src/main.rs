@@ -8,7 +8,7 @@ use teloxide::prelude::*;
 use tokio::time::{interval, Duration};
 
 use crate::db::Database;
-use crate::handlers::{Command, Handlers};
+use crate::handlers::Handlers;
 
 #[tokio::main]
 async fn main() {
@@ -35,20 +35,19 @@ async fn main() {
         }
     });
 
-    let handler = Update::filter_message()
-        .filter_command::<Command>()
-        .endpoint({
-            let handlers = handlers.clone();
-            move |bot: Bot, msg: Message, cmd: Command| {
-                let handlers = handlers.clone();
-                async move { handlers.handle_command(bot, msg, cmd).await }
-            }
-        })
+    let handler = dptree::entry()
         .branch(Update::filter_message().endpoint({
             let handlers = handlers.clone();
             move |bot: Bot, msg: Message| {
                 let handlers = handlers.clone();
                 async move { handlers.handle_message(bot, msg).await }
+            }
+        }))
+        .branch(Update::filter_callback_query().endpoint({
+            let handlers = handlers.clone();
+            move |bot: Bot, q: CallbackQuery| {
+                let handlers = handlers.clone();
+                async move { handlers.handle_callback_query(bot, q).await }
             }
         }));
 
@@ -65,19 +64,23 @@ async fn check_reminders(db: &Database, bot: &Bot) {
             for (reminder, note) in reminders {
                 let text = format!(
                     "⏰ <b>Напоминание</b>\n\n<b>{}</b>\n\n{}",
-                    note.title, note.content
+                    utils::escape_html(&note.title),
+                    utils::escape_html(&note.content)
                 );
 
-                if let Err(e) = bot
+                match bot
                     .send_message(ChatId(note.user_id), text)
                     .parse_mode(teloxide::types::ParseMode::Html)
                     .await
                 {
-                    log::error!("Failed to send reminder: {}", e);
-                }
-
-                if let Err(e) = db.mark_reminder_sent(reminder.id).await {
-                    log::error!("Failed to mark reminder as sent: {}", e);
+                    Ok(_) => {
+                        if let Err(e) = db.mark_reminder_sent(reminder.id).await {
+                            log::error!("Failed to mark reminder as sent: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to send reminder: {}", e);
+                    }
                 }
             }
         }

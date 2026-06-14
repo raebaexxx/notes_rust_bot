@@ -13,7 +13,9 @@ pub struct Database {
 impl Database {
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
         let options = SqliteConnectOptions::from_str(database_url)?
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .pragma("foreign_keys", "ON")
+            .pragma("journal_mode", "WAL");
 
         let pool = SqlitePoolOptions::new()
             .connect_with(options)
@@ -88,6 +90,7 @@ impl Database {
     }
 
     pub async fn get_notes(&self, user_id: i64, page: u32, per_page: u32) -> Result<Vec<Note>, sqlx::Error> {
+        let page = page.max(1);
         let offset = (page - 1) * per_page;
         let rows = sqlx::query(
             "SELECT * FROM notes WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?"
@@ -108,9 +111,10 @@ impl Database {
         }).collect())
     }
 
-    pub async fn get_note(&self, note_id: i64) -> Result<Option<Note>, sqlx::Error> {
-        let row = sqlx::query("SELECT * FROM notes WHERE id = ?")
+    pub async fn get_note(&self, note_id: i64, user_id: i64) -> Result<Option<Note>, sqlx::Error> {
+        let row = sqlx::query("SELECT * FROM notes WHERE id = ? AND user_id = ?")
             .bind(note_id)
+            .bind(user_id)
             .fetch_optional(&self.pool)
             .await?;
 
@@ -124,9 +128,10 @@ impl Database {
         }))
     }
 
-    pub async fn delete_note(&self, note_id: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM notes WHERE id = ?")
+    pub async fn delete_note(&self, note_id: i64, user_id: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM notes WHERE id = ? AND user_id = ?")
             .bind(note_id)
+            .bind(user_id)
             .execute(&self.pool)
             .await?;
 
@@ -134,12 +139,13 @@ impl Database {
     }
 
     pub async fn search_notes(&self, user_id: i64, query: &str) -> Result<Vec<Note>, sqlx::Error> {
+        let escaped = query.replace('%', "\\%").replace('_', "\\_");
         let rows = sqlx::query(
-            "SELECT * FROM notes WHERE user_id = ? AND (title LIKE ? OR content LIKE ?) ORDER BY updated_at DESC"
+            "SELECT * FROM notes WHERE user_id = ? AND (title LIKE ? ESCAPE '\\\\' OR content LIKE ? ESCAPE '\\\\') ORDER BY updated_at DESC"
         )
         .bind(user_id)
-        .bind(format!("%{}%", query))
-        .bind(format!("%{}%", query))
+        .bind(format!("%{}%", escaped))
+        .bind(format!("%{}%", escaped))
         .fetch_all(&self.pool)
         .await?;
 
@@ -153,15 +159,22 @@ impl Database {
         }).collect())
     }
 
-    pub async fn add_tag(&self, note_id: i64, tag_name: &str) -> Result<(), sqlx::Error> {
+    pub async fn add_tag(&self, note_id: i64, user_id: i64, tag_name: &str) -> Result<(), sqlx::Error> {
+        let note = self.get_note(note_id, user_id).await?;
+        if note.is_none() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query("INSERT OR IGNORE INTO tags (name) VALUES (?)")
             .bind(tag_name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         let row = sqlx::query("SELECT id FROM tags WHERE name = ?")
             .bind(tag_name)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
 
         let tag_id: i64 = row.get("id");
@@ -169,38 +182,19 @@ impl Database {
         sqlx::query("INSERT OR IGNORE INTO note_tags (note_id, tag_id) VALUES (?, ?)")
             .bind(note_id)
             .bind(tag_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
+        tx.commit().await?;
         Ok(())
     }
 
-    pub async fn get_notes_by_tag(&self, user_id: i64, tag_name: &str) -> Result<Vec<Note>, sqlx::Error> {
-        let rows = sqlx::query(
-            r#"
-            SELECT n.id, n.user_id, n.title, n.content, n.created_at, n.updated_at FROM notes n
-            JOIN note_tags nt ON n.id = nt.note_id
-            JOIN tags t ON nt.tag_id = t.id
-            WHERE n.user_id = ? AND t.name = ?
-            ORDER BY n.updated_at DESC
-            "#,
-        )
-        .bind(user_id)
-        .bind(tag_name)
-        .fetch_all(&self.pool)
-        .await?;
+    pub async fn set_reminder(&self, note_id: i64, user_id: i64, remind_at: NaiveDateTime) -> Result<Option<Reminder>, sqlx::Error> {
+        let note = self.get_note(note_id, user_id).await?;
+        if note.is_none() {
+            return Ok(None);
+        }
 
-        Ok(rows.into_iter().map(|row| Note {
-            id: row.get("id"),
-            user_id: row.get("user_id"),
-            title: row.get("title"),
-            content: row.get("content"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-        }).collect())
-    }
-
-    pub async fn set_reminder(&self, note_id: i64, remind_at: NaiveDateTime) -> Result<Reminder, sqlx::Error> {
         let result = sqlx::query(
             "INSERT INTO reminders (note_id, remind_at) VALUES (?, ?) RETURNING *"
         )
@@ -209,12 +203,12 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(Reminder {
+        Ok(Some(Reminder {
             id: result.get("id"),
             note_id: result.get("note_id"),
             remind_at: result.get("remind_at"),
             is_sent: result.get("is_sent"),
-        })
+        }))
     }
 
     pub async fn get_pending_reminders(&self) -> Result<Vec<(Reminder, Note)>, sqlx::Error> {
