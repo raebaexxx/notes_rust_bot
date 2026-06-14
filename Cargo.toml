@@ -1,0 +1,15 @@
+[package]
+name = "telegram-notes-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+teloxide = { version = "0.17.0", features = ["sqlite-storage-rustls", "macros"] }
+sqlx = { version = "0.8.0", features = ["runtime-tokio", "sqlite", "chrono"] }
+tokio = { version = "1.0", features = ["full"] }
+dotenv = "0.15.0"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2.0"
+log = "0.4"
+pretty_env_logger = "0.5"
+serde = { version = "1.0", features = ["derive"] }
